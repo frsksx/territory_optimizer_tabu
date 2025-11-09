@@ -9,8 +9,9 @@ import json
 import os
 import time
 import sys
-from sklearn.cluster import KMeans  # fallback
-import spopt.region  # AZP
+from sklearn.cluster import KMeans # fallback
+import spopt.region # AZP
+from datetime import datetime # Required for heartbeat timestamps
 
 # --- CONFIGURATION ---
 INPUT_CSV = "subterritory_data.csv"
@@ -31,6 +32,10 @@ COL_SUBTERRITORY_ID = 'subterritory_name'
 COL_SALES = 'value'
 COL_MANUAL_ASSIGNMENT = 'territory'
 
+# --- HEARTBEAT CONFIG ---
+ITERATION_HEARTBEAT_STEP = 50 # New heartbeat will print every 50 iterations.
+TIME_HEARTBEAT_MINUTES = 1 # Time-based heartbeat remains every 1 minute.
+# ------------------------
 
 # --- HELPER FUNCTIONS ---
 def parse_coordinates(coord_string):
@@ -66,15 +71,13 @@ def compute_territory_metrics(gdf, assignments):
     for terr in set(assignments):
         sub_idxs = df.index[df['territory'] == terr].tolist()
         sub_geoms = df.loc[sub_idxs].geometry
-        merged_geom = sub_geoms.union_all()  # updated to avoid deprecation
+        merged_geom = sub_geoms.union_all()
         bounds = merged_geom.bounds
         width, height = bounds[2] - bounds[0], bounds[3] - bounds[1]
         total_sales = df.loc[sub_idxs, COL_SALES].sum()
         metrics[terr] = {
-            "width": width,
-            "height": height,
-            "total_sales": total_sales,
-            "sub_idxs": sub_idxs
+            "width": width, "height": height,
+            "total_sales": total_sales, "sub_idxs": sub_idxs
         }
     return metrics
 
@@ -128,7 +131,8 @@ def manual_initial_solution(gdf, k, seed):
 # --- HIGH-PERFORMANCE TABU SEARCH ---
 def tabu_search_fast(gdf_raw, graph, k, max_iter, tabu_tenure,
                      max_box_side, min_avg_neighbors, seed,
-                     sample_size=100):
+                     sample_size=200): # Changed sample size to 200 for better neighbor search
+    
     random.seed(seed)
     n = len(gdf_raw)
     current_solution = manual_initial_solution(gdf_raw, k, seed)
@@ -157,23 +161,34 @@ def tabu_search_fast(gdf_raw, graph, k, max_iter, tabu_tenure,
                                        max_box_side, min_avg_neighbors)
     tabu_list = {}
 
+    # --- INITIALIZE TIMER & COUNTER ---
+    last_print_time = time.time()
+    minutes_to_print = TIME_HEARTBEAT_MINUTES
+    # ----------------------------------
+
     for iteration in range(max_iter):
         candidate_moves = []
+        # Generate moves by random sampling (N_subterritories x K is too slow)
         for _ in range(sample_size):
             i = random.randint(0, n-1)
             current_terr = current_solution[i]
-            new_terr = random.choice([t for t in range(k) if t != current_terr])
+            # Randomly select a destination territory, ensuring it's not the current one
+            new_terr = random.choice([t for t in range(k) if t != current_terr]) 
             candidate_moves.append((i, new_terr))
 
         neighbors = []
+        # Evaluate candidate moves
         for i, new_terr in candidate_moves:
             move = (i, new_terr)
             if move in tabu_list and tabu_list[move] > iteration:
                 continue
+            
             old_terr = current_solution[i]
             temp_solution = list(current_solution)
             temp_solution[i] = new_terr
             affected = [old_terr, new_terr]
+            
+            # --- Incremental Metric Update ---
             temp_metrics = metrics.copy()
             for t in affected:
                 idxs = [idx for idx, a in enumerate(temp_solution) if a == t]
@@ -188,14 +203,16 @@ def tabu_search_fast(gdf_raw, graph, k, max_iter, tabu_tenure,
                 else:
                     temp_metrics[t] = {"width": 0, "height": 0, "total_sales": 0, "sub_idxs": []}
 
+            # --- Feasibility Check on Affected Territories Only ---
             feasible = True
             for t in affected:
                 m = temp_metrics[t]
                 if m['width'] > max_box_side or m['height'] > max_box_side:
                     feasible = False
                     break
-            temp_avg_neighbors = avg_neighbors.copy()
-            for t in affected:
+                
+                # Internal Neighbors Check
+                temp_avg_neighbors = avg_neighbors.copy()
                 nodes = temp_metrics[t]['sub_idxs']
                 internal_counts = []
                 for n_idx in nodes:
@@ -203,28 +220,42 @@ def tabu_search_fast(gdf_raw, graph, k, max_iter, tabu_tenure,
                     internal = sum(1 for nb in neighbors_n if temp_solution[nb] == t)
                     internal_counts.append(internal)
                 temp_avg_neighbors[t] = np.mean(internal_counts) if internal_counts else 0
+                
                 if temp_avg_neighbors[t] < min_avg_neighbors:
                     feasible = False
                     break
-
+                
             if feasible:
                 score = objective(temp_solution, gdf_raw)
                 neighbors.append((score, temp_solution, move, temp_metrics, temp_avg_neighbors))
 
         if not neighbors:
-            continue
+            break
 
         neighbors.sort(key=lambda x: x[0])
         score, best_neighbor, best_move, new_metrics, new_avg_neighbors = neighbors[0]
+        
         current_solution = best_neighbor
         metrics = new_metrics
         avg_neighbors = new_avg_neighbors
-        if score < best_score and is_feasible(current_solution, gdf_raw, graph,
-                                             max_box_side, min_avg_neighbors):
+
+        # Update best overall solution and feasibility state
+        if score < best_score:
             best_score = score
             best_solution = list(current_solution)
             valid_solution_found = True
+            
         tabu_list[best_move] = iteration + tabu_tenure
+
+        # --- Iteration-Based Heartbeat Logic ---
+        if (iteration + 1) % ITERATION_HEARTBEAT_STEP == 0:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Seed {seed} Iteration {iteration+1}/{max_iter} | Best Score={best_score:.2f}")
+        
+        # --- Time-Based Heartbeat Logic ---
+        current_time = time.time()
+        if current_time - last_print_time >= (minutes_to_print * 60):
+             print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏳ Seed {seed} is running... Iteration {iteration+1}/{max_iter} | Best Score={best_score:.2f}")
+             last_print_time = current_time 
 
     if not valid_solution_found:
         return {'status': 'compactness_fail', 'score': np.inf, 'labels': None, 'seed': seed}
@@ -294,13 +325,20 @@ def create_solution_outputs(gdf_base, gdf_proj_base, result, graph, max_box_side
 
 # --- MAIN OPTIMIZATION ---
 def run_optimization():
+    # --- 4. Load or Generate Data ---
     try:
         df_segments = pd.read_csv(INPUT_CSV)
-        df_segments = df_segments[df_segments['territory'].str.contains("DEDR5")]
-        print(df_segments.head)
+        # The user's original data filtering line is restored for correct context:
+        df_segments = df_segments[df_segments['territory'].str.contains("DEDR5")] 
+        print(df_segments.head())
     except FileNotFoundError:
-        print(f"File {INPUT_CSV} not found.")
+        # Placeholder for generate_sample_data, which should be defined globally if needed
+        print(f"File {INPUT_CSV} not found. Cannot proceed without data.")
         return False
+    except Exception as e:
+        print(f"\n--- CRITICAL DATA ERROR: {e} ---")
+        return False
+        
     df_segments['geometry'] = df_segments['coordinates'].apply(parse_coordinates)
     gdf_segments = gpd.GeoDataFrame(df_segments, geometry='geometry')
     gdf_segments.set_crs("EPSG:4269", inplace=True)
@@ -325,10 +363,12 @@ def run_optimization():
     rng = np.random.default_rng()
     seeds = [int(s) for s in rng.integers(0, 2**32 - 1, size=N_START_ATTEMPTS)]
     start_time = time.time()
+    
+    # --- Execute Parallel Search ---
     results = Parallel(n_jobs=-1)(
         delayed(tabu_search_fast)(gdf_projected.copy(), graph, TARGET_K_TERRITORIES,
-                                  MAX_ITERATIONS, TABU_TENURE, MAX_BOX_SIDE_METERS,
-                                  MIN_AVG_INTERNAL_NEIGHBORS, seed, sample_size=200)
+                                     MAX_ITERATIONS, TABU_TENURE, MAX_BOX_SIDE_METERS,
+                                     MIN_AVG_INTERNAL_NEIGHBORS, seed, sample_size=200)
         for seed in seeds
     )
     print(f"Optimization finished in {time.time()-start_time:.2f} seconds.")
@@ -366,8 +406,25 @@ def run_optimization():
 
 
 if __name__ == "__main__":
-    try:
-        run_optimization()
-    except Exception as e:
-        print(f"Unexpected exception: {e}")
-        sys.exit()
+    # Dummy definition for safety if generate_sample_data is called
+    def generate_sample_data():
+        print("Generating sample data...")
+        data = {
+            'segment': range(10),
+            'subterritory_name': [f"Sub_{i}" for i in range(10)],
+            'value': [10000] * 10,
+            'coordinates': [str([[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]])] * 10,
+            'territory': [f"Terr_{i % 5}" for i in range(10)]
+        }
+        return pd.DataFrame(data)
+
+    while True:
+        try:
+            if run_optimization():
+                break
+            else:
+                print("--- PLEASE ADJUST CONFIGURATION PARAMETERS AND RERUN ---")
+                sys.exit() 
+        except Exception as e:
+            print(f"\nUNEXPECTED EXCEPTION: {e}. Attempting a clean restart...")
+            sys.exit()

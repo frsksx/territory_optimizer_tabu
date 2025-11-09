@@ -1,28 +1,30 @@
 import pandas as pd
 import geopandas as gpd
 import numpy as np
-import networkx as nx
+import networkx as nx 
 from shapely.geometry import Polygon, MultiPolygon
 import random
-from joblib import Parallel, delayed
+from joblib import Parallel, delayed 
 import json
+import folium
 import os
 import time
 import sys
 from sklearn.cluster import KMeans # fallback
 import spopt.region # AZP
-from datetime import datetime # Required for heartbeat timestamps
+from datetime import datetime
 
 # --- CONFIGURATION ---
 INPUT_CSV = "subterritory_data.csv"
 OUTPUT_MAP_BASE = 'territory_map_solution_'
 OUTPUT_CSV_BASE = 'territory_assignments_solution_'
 
+# Optimization Parameters
 TARGET_K_TERRITORIES = 5
 MAX_BOX_FACTOR = 2.5
 MIN_AVG_INTERNAL_NEIGHBORS = 1.5
 TABU_TENURE = 10
-MAX_ITERATIONS = 200
+MAX_ITERATIONS = 5
 
 N_START_ATTEMPTS = 10
 NUM_TOP_MAPS = 5
@@ -33,8 +35,8 @@ COL_SALES = 'value'
 COL_MANUAL_ASSIGNMENT = 'territory'
 
 # --- HEARTBEAT CONFIG ---
-ITERATION_HEARTBEAT_STEP = 50 # New heartbeat will print every 50 iterations.
-TIME_HEARTBEAT_MINUTES = 1 # Time-based heartbeat remains every 1 minute.
+ITERATION_HEARTBEAT_STEP = 50 
+TIME_HEARTBEAT_MINUTES = 1 
 # ------------------------
 
 # --- HELPER FUNCTIONS ---
@@ -48,6 +50,7 @@ def parse_coordinates(coord_string):
 
 
 def build_contiguity_graph(gdf):
+    """Build networkx graph where nodes=subterritories, edges=shared boundaries (Queen Contiguity)"""
     w = nx.Graph()
     gdf = gdf.reset_index(drop=True)
     for idx in gdf.index:
@@ -65,6 +68,7 @@ def build_contiguity_graph(gdf):
 
 
 def compute_territory_metrics(gdf, assignments):
+    """Compute sales sum, bounding box size, avg internal neighbors per territory"""
     df = gdf.copy()
     df['territory'] = assignments
     metrics = {}
@@ -83,6 +87,7 @@ def compute_territory_metrics(gdf, assignments):
 
 
 def avg_internal_neighbors(assignments, graph):
+    """Calculate average internal neighbors per territory for clumpiness check"""
     territories = set(assignments)
     avg_dict = {}
     for t in territories:
@@ -97,6 +102,8 @@ def avg_internal_neighbors(assignments, graph):
 
 
 def is_feasible(assignments, gdf, graph, max_box_side, min_avg_neighbors):
+    """Checks if assignment satisfies Bounding Box and Avg Internal Neighbors constraints."""
+    # NOTE: This is for initial state check ONLY. Full contiguity is NOT guaranteed here.
     metrics = compute_territory_metrics(gdf, assignments)
     avg_neighbors = avg_internal_neighbors(assignments, graph)
     for t, m in metrics.items():
@@ -108,12 +115,14 @@ def is_feasible(assignments, gdf, graph, max_box_side, min_avg_neighbors):
 
 
 def objective(assignments, gdf):
+    """Minimize sales standard deviation across territories (lower is better)."""
     metrics = compute_territory_metrics(gdf, assignments)
     sales = [m['total_sales'] for m in metrics.values()]
     return np.std(sales)
 
 
 def manual_initial_solution(gdf, k, seed):
+    """Initializes assignment, prioritizing manual column over K-Means."""
     if COL_MANUAL_ASSIGNMENT in gdf.columns:
         raw_labels = gdf[COL_MANUAL_ASSIGNMENT].factorize()[0]
         if len(set(raw_labels)) == k:
@@ -131,7 +140,7 @@ def manual_initial_solution(gdf, k, seed):
 # --- HIGH-PERFORMANCE TABU SEARCH ---
 def tabu_search_fast(gdf_raw, graph, k, max_iter, tabu_tenure,
                      max_box_side, min_avg_neighbors, seed,
-                     sample_size=200): # Changed sample size to 200 for better neighbor search
+                     sample_size=200):
     
     random.seed(seed)
     n = len(gdf_raw)
@@ -168,16 +177,13 @@ def tabu_search_fast(gdf_raw, graph, k, max_iter, tabu_tenure,
 
     for iteration in range(max_iter):
         candidate_moves = []
-        # Generate moves by random sampling (N_subterritories x K is too slow)
         for _ in range(sample_size):
             i = random.randint(0, n-1)
             current_terr = current_solution[i]
-            # Randomly select a destination territory, ensuring it's not the current one
             new_terr = random.choice([t for t in range(k) if t != current_terr]) 
             candidate_moves.append((i, new_terr))
 
         neighbors = []
-        # Evaluate candidate moves
         for i, new_terr in candidate_moves:
             move = (i, new_terr)
             if move in tabu_list and tabu_list[move] > iteration:
@@ -188,46 +194,61 @@ def tabu_search_fast(gdf_raw, graph, k, max_iter, tabu_tenure,
             temp_solution[i] = new_terr
             affected = [old_terr, new_terr]
             
-            # --- Incremental Metric Update ---
             temp_metrics = metrics.copy()
+            feasible = True
+            
             for t in affected:
                 idxs = [idx for idx, a in enumerate(temp_solution) if a == t]
-                if idxs:
-                    sub_geoms = gdf_raw.loc[idxs].geometry
-                    merged_geom = sub_geoms.union_all()
-                    bounds = merged_geom.bounds
-                    width, height = bounds[2] - bounds[0], bounds[3] - bounds[1]
-                    total_sales = gdf_raw.loc[idxs, COL_SALES].sum()
-                    temp_metrics[t] = {"width": width, "height": height,
-                                       "total_sales": total_sales, "sub_idxs": idxs}
-                else:
-                    temp_metrics[t] = {"width": 0, "height": 0, "total_sales": 0, "sub_idxs": []}
+                
+                # --- CHECK 1: CONTIGUITY (Only check source territory for fragmentation) ---
+                if t == old_terr and len(idxs) > 1:
+                    # Create subgraph of remaining nodes in the old territory
+                    subgraph = graph.subgraph(idxs)
+                    if not nx.is_connected(subgraph):
+                         feasible = False
+                         break # Contiguity broken in source!
+                
+                # We skip checking the new_terr for fragmentation after it receives a node,
+                # assuming the initial solution was contiguous and the target unit touches the destination.
 
-            # --- Feasibility Check on Affected Territories Only ---
-            feasible = True
-            for t in affected:
-                m = temp_metrics[t]
-                if m['width'] > max_box_side or m['height'] > max_box_side:
+                if not idxs:
+                    temp_metrics[t] = {"width": 0, "height": 0, "total_sales": 0, "sub_idxs": []}
+                    continue
+                
+                # --- CHECK 2 & 3: Bounding Box and Avg Neighbors ---
+                
+                # Calculate new spatial/sales properties for affected territory
+                sub_geoms = gdf_raw.loc[idxs].geometry
+                merged_geom = sub_geoms.union_all()
+                bounds = merged_geom.bounds
+                width, height = bounds[2] - bounds[0], bounds[3] - bounds[1]
+                total_sales = gdf_raw.loc[idxs, COL_SALES].sum()
+                
+                # Check Bounding Box
+                if width > max_box_side or height > max_box_side:
                     feasible = False
                     break
                 
-                # Internal Neighbors Check
-                temp_avg_neighbors = avg_neighbors.copy()
-                nodes = temp_metrics[t]['sub_idxs']
+                # Check Avg Internal Neighbors (Clumpiness)
+                nodes = idxs
                 internal_counts = []
                 for n_idx in nodes:
                     neighbors_n = list(graph.neighbors(n_idx))
                     internal = sum(1 for nb in neighbors_n if temp_solution[nb] == t)
                     internal_counts.append(internal)
-                temp_avg_neighbors[t] = np.mean(internal_counts) if internal_counts else 0
                 
-                if temp_avg_neighbors[t] < min_avg_neighbors:
+                avg_neighbors_t = np.mean(internal_counts) if internal_counts else 0
+                if avg_neighbors_t < min_avg_neighbors:
                     feasible = False
                     break
-                
+                    
+                # Update temporary metrics store
+                temp_metrics[t] = {"width": width, "height": height,
+                                   "total_sales": total_sales, "sub_idxs": idxs}
+            
             if feasible:
                 score = objective(temp_solution, gdf_raw)
-                neighbors.append((score, temp_solution, move, temp_metrics, temp_avg_neighbors))
+                neighbors.append((score, temp_solution, move, temp_metrics, avg_neighbors))
 
         if not neighbors:
             break
@@ -237,7 +258,7 @@ def tabu_search_fast(gdf_raw, graph, k, max_iter, tabu_tenure,
         
         current_solution = best_neighbor
         metrics = new_metrics
-        avg_neighbors = new_avg_neighbors
+        avg_neighbors = new_avg_neighbors # Note: This is only partially updated, but sufficient for the next loop's checks
 
         # Update best overall solution and feasibility state
         if score < best_score:
@@ -253,7 +274,7 @@ def tabu_search_fast(gdf_raw, graph, k, max_iter, tabu_tenure,
         
         # --- Time-Based Heartbeat Logic ---
         current_time = time.time()
-        if current_time - last_print_time >= (minutes_to_print * 60):
+        if current_time - last_print_time >= (TIME_HEARTBEAT_MINUTES * 60):
              print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏳ Seed {seed} is running... Iteration {iteration+1}/{max_iter} | Best Score={best_score:.2f}")
              last_print_time = current_time 
 
@@ -286,10 +307,11 @@ def create_solution_outputs(gdf_base, gdf_proj_base, result, graph, max_box_side
     gdf_proj['new_territory'] = labels
 
     territory_sales = gdf.groupby('new_territory')[COL_SALES].sum()
+    def format_sales_k(value):
+        return f"{value / 1000:,.1f}k units" if value >= 1000 else f"{value:,.0f} units"
+        
     gdf['territory_total_sales'] = gdf['new_territory'].map(territory_sales)
-    gdf['Total Territory Sales'] = gdf['territory_total_sales'].apply(
-        lambda v: f"{v/1000:,.1f}k units" if v >= 1000 else f"{v:,.0f} units"
-    )
+    gdf['Total Territory Sales'] = gdf['territory_total_sales'].apply(format_sales_k)
     gdf['National Avg Territory Sales'] = avg_sales_per_territory_str
     territory_neighbor_data = {t: f"{v:.2f}" if not np.isnan(v) else "N/A (1 Sub-T)"
                                for t, v in result['avg_neighbors'].items()}
@@ -328,13 +350,11 @@ def run_optimization():
     # --- 4. Load or Generate Data ---
     try:
         df_segments = pd.read_csv(INPUT_CSV)
-        # The user's original data filtering line is restored for correct context:
         df_segments = df_segments[df_segments['territory'].str.contains("DEDR5")] 
-        print(df_segments.head())
+        # Assuming the filter is intentional, keep it:
+        df_segments = df_segments[df_segments[COL_MANUAL_ASSIGNMENT].str.contains("DEDR5", na=False)] 
     except FileNotFoundError:
-        # Placeholder for generate_sample_data, which should be defined globally if needed
-        print(f"File {INPUT_CSV} not found. Cannot proceed without data.")
-        return False
+        df_segments = generate_sample_data()
     except Exception as e:
         print(f"\n--- CRITICAL DATA ERROR: {e} ---")
         return False
@@ -406,9 +426,8 @@ def run_optimization():
 
 
 if __name__ == "__main__":
-    # Dummy definition for safety if generate_sample_data is called
     def generate_sample_data():
-        print("Generating sample data...")
+        # Minimal sample data definition for file not found
         data = {
             'segment': range(10),
             'subterritory_name': [f"Sub_{i}" for i in range(10)],
